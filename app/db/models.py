@@ -247,3 +247,51 @@ class IdSequence(Base):
     value: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("0")
     )
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+
+    __table_args__ = (
+        Index(
+            "ix_user_sessions_user_expires_at",
+            "user_id",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Store only the SHA-256 digest of the session cookie token.
+    token_hash: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        nullable=False,
+    )
+
+    # A random CSRF token is tied to this server-side session.
+    csrf_token: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
