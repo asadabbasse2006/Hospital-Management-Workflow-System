@@ -1,3 +1,4 @@
+from app.modules.patients.router import router as patients_router
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -9,6 +10,7 @@ app = FastAPI(
     version="0.1.0",
 )
 
+app.include_router(patients_router, prefix="/api/v1")
 
 @app.get("/health/live", tags=["System"])
 def liveness():
