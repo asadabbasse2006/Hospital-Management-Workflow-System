@@ -125,3 +125,17 @@ def test_doctor_cannot_access_lab_order_list(client, create_user):
     assert response.json()["detail"] == (
         "You do not have permission to perform this action."
     )
+
+
+def test_unauthenticated_users_cannot_access_protected_routes(client):
+    protected_routes = [
+        "/api/v1/patients/visits/queue",
+        "/api/v1/laboratory/orders",
+    ]
+
+    for route in protected_routes:
+        response = client.get(route)
+        assert response.status_code == 401, (
+            f"Expected 401 for {route}, got {response.status_code}: "
+            f"{response.text}"
+        )
