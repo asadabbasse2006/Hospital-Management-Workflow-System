@@ -295,3 +295,32 @@ class UserSession(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class VisitStatusHistory(Base):
+    __tablename__ = "visit_status_history"
+
+    id = mapped_column(Integer, primary_key=True, index=True)
+
+    visit_pk = mapped_column(
+        ForeignKey("visits.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    changed_by_user_id = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    from_status = mapped_column(String(30), nullable=False)
+    to_status = mapped_column(String(30), nullable=False)
+    reason = mapped_column(String(500), nullable=True)
+
+    changed_at = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+

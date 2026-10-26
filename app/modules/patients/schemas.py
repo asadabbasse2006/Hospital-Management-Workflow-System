@@ -1,6 +1,6 @@
 import re
+from typing import Literal
 from datetime import date, datetime
-
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -135,3 +135,90 @@ class VisitRead(BaseModel):
 class PatientVisitResponse(BaseModel):
     patient: PatientRead
     visit: VisitRead
+
+
+
+class PatientUpdateRequest(BaseModel):
+    """Fields that can be changed through the patient update endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    patient_name: str | None = Field(
+        default=None, min_length=1, max_length=150
+    )
+    father_or_husband_name: str | None = Field(
+        default=None, max_length=150
+    )
+    location: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=20)
+    date_of_birth: date | None = None
+    gender: str | None = Field(default=None, max_length=30)
+    address: str | None = Field(default=None, max_length=500)
+
+    @field_validator(
+        "patient_name",
+        "father_or_husband_name",
+        "location",
+        "gender",
+        "address",
+        mode="before",
+    )
+    @classmethod
+    def strip_text(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+        return value
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value):
+        if value is None:
+            return None
+        if not value.strip():
+            return None
+        return normalize_phone(value)
+
+    @field_validator("patient_name")
+    @classmethod
+    def validate_patient_name(cls, value):
+        if value is None or not value:
+            raise ValueError("Patient name cannot be empty.")
+        return value
+
+
+
+class PatientSearchRead(BaseModel):
+    """Minimal patient information for search results."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    patient_id: str
+    patient_name: str
+    gender: str | None = None
+
+
+class VisitStatusTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "With Doctor",
+        "Lab Tests",
+        "Pharmacy",
+        "Printing",
+        "Completed",
+    ]
+    reason: str | None = Field(default=None, max_length=500)
+
+
+
+class VisitQueueRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    visit_id: str
+    patient_business_id: str
+    patient_name: str
+    doctor_id: int
+    status: str
+    priority: str
+    created_at: datetime

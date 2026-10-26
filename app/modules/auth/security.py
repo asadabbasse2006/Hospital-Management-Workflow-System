@@ -1,7 +1,7 @@
 import hashlib
 
 from pwdlib import PasswordHash
-
+from pwdlib.exceptions import UnknownHashError
 
 password_hasher = PasswordHash.recommended()
 
