@@ -30,6 +30,7 @@ from app.modules.patients.schemas import (
 )
 
 from app.modules.patients.schemas import normalize_cnic, normalize_phone
+from app.modules.patients.workflow import can_transition
 
 
 def _next_sequence(db: Session, sequence_name: str) -> int:

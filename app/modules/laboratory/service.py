@@ -39,7 +39,7 @@ def create_lab_order(
         .with_for_update()
     )
 
-    if visit is None:
+    if visit is None or visit.doctor_id != actor_user_id:
         raise ValueError("Visit not found.")
 
     if visit.status != "With Doctor":

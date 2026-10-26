@@ -189,7 +189,7 @@ def doctor_assignment_data(db, create_user):
         priority="Normal",
     )
     db.add(visit)
-    db.commit()
+    db.flush()
 
     return {
         "doctor_one": doctor_one,

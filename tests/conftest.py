@@ -55,6 +55,7 @@ def db(test_engine):
         bind=connection,
         autoflush=False,
         expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
     )
 
     try:
