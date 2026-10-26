@@ -2,39 +2,29 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.modules.patients.schemas import (
-    CreateVisitRequest,
-    PatientRead,
-    PatientVisitResponse,
-    RegisterPatientWithVisit,
-)
-from app.modules.auth.schemas import UserPublic
-
-from app.modules.patients.schemas import PatientUpdateRequest
-from app.modules.patients.service import update_patient
-
-from app.db.models import Role, User
-from app.modules.patients.schemas import (
-    VisitQueueRead,
-    VisitStatusTransitionRequest,
-    VisitRead,
-)
-
-from app.modules.patients.service import (
-    get_visit_queue,
-    transition_visit,
-)
-
-from app.modules.patients.service import (
-    create_visit_for_existing_patient,
-    register_patient_with_first_visit,
-    search_patients,
-)
-
 from app.modules.auth.dependencies import (
     get_current_user,
     require_csrf,
     require_roles,
+)
+from app.modules.auth.schemas import UserPublic
+from app.modules.patients.schemas import (
+    CreateVisitRequest,
+    PatientRead,
+    PatientUpdateRequest,
+    PatientVisitResponse,
+    RegisterPatientWithVisit,
+    VisitQueueRead,
+    VisitRead,
+    VisitStatusTransitionRequest,
+)
+from app.modules.patients.service import (
+    create_visit_for_existing_patient,
+    get_visit_queue,
+    register_patient_with_first_visit,
+    search_patients,
+    transition_visit,
+    update_patient,
 )
 
 router = APIRouter(
@@ -50,7 +40,7 @@ router = APIRouter(
     status_code=201,
     dependencies=[
         Depends(require_csrf),
-        Depends(require_roles("Receptionist")),
+        Depends(require_roles("Receptionist", "Admin")),
     ],
 )
 def register_patient(
@@ -60,26 +50,27 @@ def register_patient(
     return register_patient_with_first_visit(db, data)
 
 
-
 @router.get(
     "/search",
     response_model=list[PatientRead],
     dependencies=[
-        Depends(
-            require_roles(
-                "Admin",
-                "Receptionist",
-                "Doctor",
-            )
-        ),
+        Depends(require_roles("Admin", "Receptionist", "Doctor")),
     ],
 )
 def search_patient_records(
     query: str = Query(min_length=1, max_length=100),
     db: Session = Depends(get_db),
+    current_user: UserPublic = Depends(get_current_user),
 ):
-    return search_patients(db, query)
-
+    return search_patients(
+        db=db,
+        query=query,
+        doctor_user_id=(
+            current_user.id
+            if current_user.role == "Doctor"
+            else None
+        ),
+    )
 
 
 @router.post(
@@ -88,7 +79,7 @@ def search_patient_records(
     status_code=201,
     dependencies=[
         Depends(require_csrf),
-        Depends(require_roles("Receptionist")),
+        Depends(require_roles("Receptionist", "Admin")),
     ],
 )
 def create_existing_patient_visit(
@@ -101,13 +92,12 @@ def create_existing_patient_visit(
     )
 
 
-
 @router.patch(
     "/{patient_business_id}",
     response_model=PatientRead,
     dependencies=[
         Depends(require_csrf),
-        Depends(require_roles("Receptionist", "Doctor")),
+        Depends(require_roles("Admin", "Receptionist", "Doctor")),
     ],
 )
 def update_patient_record(
@@ -120,9 +110,13 @@ def update_patient_record(
         db=db,
         patient_business_id=patient_business_id,
         data=data,
-        can_update_phone=(current_user.role == "Receptionist"),
+        can_update_phone=(current_user.role in ("Receptionist", "Admin")),
+        doctor_user_id=(
+            current_user.id
+            if current_user.role == "Doctor"
+            else None
+        ),
     )
-
 
 
 @router.get(
@@ -138,7 +132,6 @@ def visit_queue(
         role_name=current_user.role,
         user_id=current_user.id,
     )
-
 
 
 @router.patch(

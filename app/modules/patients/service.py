@@ -237,11 +237,14 @@ def create_visit_for_existing_patient(
         db.rollback()
         raise
 
+
 def search_patients(
     db: Session,
     query: str,
+    *,
+    doctor_user_id: int | None = None,
 ) -> list[PatientRead]:
-    """Exact search using patient ID, CNIC, or phone."""
+    """Search patients, optionally restricting results to a doctor's patients."""
     query = query.strip()
 
     if not query:
@@ -269,12 +272,19 @@ def search_patients(
         except ValueError:
             pass
 
-    statement = (
-        select(Patient)
-        .where(or_(*conditions))
-        .order_by(Patient.created_at.desc())
-        .limit(20)
-    )
+    statement = select(Patient).where(or_(*conditions))
+
+    if doctor_user_id is not None:
+        statement = statement.where(
+            select(Visit.id)
+            .where(
+                Visit.patient_id == Patient.id,
+                Visit.doctor_id == doctor_user_id,
+            )
+            .exists()
+        )
+
+    statement = statement.order_by(Patient.created_at.desc()).limit(20)
 
     patients = db.scalars(statement).all()
     return [PatientRead.model_validate(patient) for patient in patients]
@@ -286,6 +296,7 @@ def update_patient(
     data: PatientUpdateRequest,
     *,
     can_update_phone: bool,
+    doctor_user_id: int | None = None,
 ) -> PatientRead:
     """Update permitted patient fields and enforce field-level access."""
     changes = data.model_dump(exclude_unset=True)
@@ -313,6 +324,21 @@ def update_patient(
             status_code=404,
             detail="Patient not found.",
         )
+
+    if doctor_user_id is not None:
+        has_assigned_visit = db.scalar(
+            select(Visit.id)
+            .where(
+                Visit.patient_id == patient.id,
+                Visit.doctor_id == doctor_user_id,
+            )
+            .limit(1)
+        )
+        if has_assigned_visit is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found.",
+            )
 
     try:
         for field, value in changes.items():
@@ -346,13 +372,6 @@ def update_patient(
         raise
 
 
-from sqlalchemy import select
-
-from app.db.models import Patient, Visit
-
-from app.modules.patients.workflow import can_transition
-
-
 def transition_visit(
     db: Session,
     visit_business_id: str,
@@ -369,7 +388,7 @@ def transition_visit(
             .with_for_update()
         )
 
-        if visit is None:
+        if visit is None or (role_name == "Doctor" and visit.doctor_id != actor_user_id):
             raise HTTPException(
                 status_code=404,
                 detail="Visit not found.",

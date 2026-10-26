@@ -1,8 +1,17 @@
 
 import pytest
 
-from app.db.models import Role, User
+from app.db.models import Role, User, DoctorProfile, Patient, Visit
 from app.modules.auth.security import hash_password
+from app.core.rate_limit import limiter
+
+
+@pytest.fixture(autouse=True)
+def reset_auth_rate_limit():
+    """Reset in-memory rate-limit state between authentication tests."""
+    limiter._storage.reset()
+    yield
+    limiter._storage.reset()
 
 
 @pytest.fixture
@@ -139,3 +148,97 @@ def test_unauthenticated_users_cannot_access_protected_routes(client):
             f"Expected 401 for {route}, got {response.status_code}: "
             f"{response.text}"
         )
+
+
+@pytest.fixture
+def doctor_assignment_data(db, create_user):
+    doctor_one = create_user(
+        username="doctor.one",
+        role_name="Doctor",
+    )
+    doctor_two = create_user(
+        username="doctor.two",
+        role_name="Doctor",
+    )
+
+    db.add_all([
+        DoctorProfile(
+            user_id=doctor_one.id,
+            consultation_fee=1000,
+        ),
+        DoctorProfile(
+            user_id=doctor_two.id,
+            consultation_fee=1000,
+        ),
+    ])
+
+    patient = Patient(
+        patient_id="PAT-TEST-001",
+        patient_name="Authorization Test Patient",
+        cnic="1234512345671",
+        phone=None,
+    )
+    db.add(patient)
+    db.flush()
+
+    visit = Visit(
+        visit_id="VIS-2026-TEST1",
+        patient_id=patient.id,
+        doctor_id=doctor_two.id,
+        status="With Doctor",
+        priority="Normal",
+    )
+    db.add(visit)
+    db.commit()
+
+    return {
+        "doctor_one": doctor_one,
+        "doctor_two": doctor_two,
+        "patient": patient,
+    }
+
+def test_doctor_cannot_search_another_doctors_patient(
+    client,
+    doctor_assignment_data,
+):
+    doctor_one = doctor_assignment_data["doctor_one"]
+
+    login_response = login(
+        client,
+        username=doctor_one.username,
+    )
+    assert login_response.status_code == 200
+
+    patient_id = doctor_assignment_data["patient"].patient_id
+
+    search_response = client.get(
+        "/api/v1/patients/search",
+        params={"query": patient_id},
+    )
+
+    assert search_response.status_code == 200
+    assert search_response.json() == []
+
+
+def test_doctor_cannot_update_another_doctors_patient(
+    client,
+    doctor_assignment_data,
+):
+    doctor_one = doctor_assignment_data["doctor_one"]
+
+    login_response = login(
+        client,
+        username=doctor_one.username,
+    )
+    assert login_response.status_code == 200
+
+    csrf_token = login_response.json()["csrf_token"]
+    patient_id = doctor_assignment_data["patient"].patient_id
+
+    update_response = client.patch(
+        f"/api/v1/patients/{patient_id}",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"address": "Unauthorized change"},
+    )
+
+    assert update_response.status_code == 404

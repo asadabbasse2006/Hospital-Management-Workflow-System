@@ -1,7 +1,11 @@
 
 import os
 
+from dotenv import load_dotenv
 import pytest
+
+load_dotenv()
+
 from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
