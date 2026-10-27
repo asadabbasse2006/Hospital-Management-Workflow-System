@@ -17,7 +17,7 @@ def reset_auth_rate_limit():
 @pytest.fixture
 def hospital_setup(db):
     roles = {}
-    for role_name in ["Admin", "Receptionist", "Doctor"]:
+    for role_name in ["Admin", "Receptionist", "Doctor", "Lab Assistant"]:
         role = Role(name=role_name)
         db.add(role)
         roles[role_name] = role
@@ -44,7 +44,21 @@ def hospital_setup(db):
         role_id=roles["Receptionist"].id,
         is_active=True,
     )
-    db.add_all([doctor_one, doctor_two, receptionist])
+    admin = User(
+        full_name="Admin One",
+        username="admin.one",
+        password_hash=hash_password("AdminPass!1"),
+        role_id=roles["Admin"].id,
+        is_active=True,
+    )
+    lab_assistant = User(
+        full_name="Lab Assistant",
+        username="lab.assistant",
+        password_hash=hash_password("LabPass!123"),
+        role_id=roles["Lab Assistant"].id,
+        is_active=True,
+    )
+    db.add_all([doctor_one, doctor_two, receptionist, admin, lab_assistant])
     db.flush()
 
     db.add_all([
@@ -88,6 +102,8 @@ def hospital_setup(db):
         "doctor_one": doctor_one,
         "doctor_two": doctor_two,
         "receptionist": receptionist,
+        "admin": admin,
+        "lab_assistant": lab_assistant,
         "patient_one": patient_one,
         "patient_two": patient_two,
         "visit_one": visit_one,
@@ -223,7 +239,9 @@ def test_doctor_can_update_assigned_patient_address_but_not_phone(client, db, ho
         json={"phone": "03009999888"},
     )
     assert res_phone.status_code == 403
-    assert res_phone.json()["detail"] == "Only Receptionists can update a patient's phone number."
+    assert res_phone.json()["detail"] == (
+        "Only Receptionists and Admins can update a patient's phone number."
+    )
 
     # Verify phone was not modified
     db.refresh(hospital_setup["patient_one"])
@@ -274,3 +292,152 @@ def test_doctor_cannot_register_patient(client, hospital_setup):
     )
     assert res.status_code == 403
     assert res.json()["detail"] == "You do not have permission to perform this action."
+
+
+def test_patient_update_normalizes_partial_changes(client, db, hospital_setup):
+    csrf_token = login_helper(client, "recep.one", "RecepPass!1")
+
+    response = client.patch(
+        f"/api/v1/patients/{hospital_setup['patient_one'].patient_id}",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"patient_name": "  Updated   Patient   Name  "},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["patient_name"] == "Updated Patient Name"
+    assert response.json()["phone"] == "03001111111"
+    assert response.json()["address"] == "Initial Address 1"
+    db.refresh(hospital_setup["patient_one"])
+    assert hospital_setup["patient_one"].patient_name == "Updated Patient Name"
+
+
+def test_patient_update_rejects_invalid_and_protected_fields(
+    client, db, hospital_setup
+):
+    csrf_token = login_helper(client, "recep.one", "RecepPass!1")
+    url = f"/api/v1/patients/{hospital_setup['patient_one'].patient_id}"
+
+    invalid_name = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"patient_name": "   "},
+    )
+    protected_id = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"patient_id": "PAT-OTHER"},
+    )
+    protected_primary_key = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"id": 999},
+    )
+    protected_cnic = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"cnic": "3520212345671"},
+    )
+    invalid_phone = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"phone": "not a phone"},
+    )
+    oversized_location = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={"location": "x" * 151},
+    )
+    empty_update = client.patch(
+        url,
+        headers={"X-CSRF-Token": csrf_token},
+        json={},
+    )
+
+    assert invalid_name.status_code == 422
+    assert protected_id.status_code == 422
+    assert protected_primary_key.status_code == 422
+    assert protected_cnic.status_code == 422
+    assert invalid_phone.status_code == 422
+    assert oversized_location.status_code == 422
+    assert empty_update.status_code == 422
+    db.refresh(hospital_setup["patient_one"])
+    assert hospital_setup["patient_one"].patient_name == (
+        "Patient One (Assigned Dr One)"
+    )
+
+
+def test_patient_update_duplicate_phone_rolls_back_all_changes(
+    client, db, hospital_setup
+):
+    csrf_token = login_helper(client, "recep.one", "RecepPass!1")
+
+    response = client.patch(
+        f"/api/v1/patients/{hospital_setup['patient_one'].patient_id}",
+        headers={"X-CSRF-Token": csrf_token},
+        json={
+            "patient_name": "Must Roll Back",
+            "phone": hospital_setup["patient_two"].phone,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "IntegrityError" not in response.text
+    assert "uq_patients" not in response.text
+    db.refresh(hospital_setup["patient_one"])
+    assert hospital_setup["patient_one"].patient_name == (
+        "Patient One (Assigned Dr One)"
+    )
+    assert hospital_setup["patient_one"].phone == "03001111111"
+
+
+def test_patient_update_missing_patient_returns_404(client, hospital_setup):
+    csrf_token = login_helper(client, "recep.one", "RecepPass!1")
+
+    response = client.patch(
+        "/api/v1/patients/PAT-MISSING",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"address": "New address"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Patient not found."
+
+
+def test_patient_update_requires_authentication_and_csrf(
+    client, hospital_setup
+):
+    url = f"/api/v1/patients/{hospital_setup['patient_one'].patient_id}"
+    payload = {"address": "New address"}
+
+    unauthenticated = client.patch(url, json=payload)
+    assert unauthenticated.status_code == 401
+
+    login_helper(client, "recep.one", "RecepPass!1")
+    missing_csrf = client.patch(url, json=payload)
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["detail"] == "Missing or invalid CSRF token."
+
+
+def test_patient_update_forbidden_for_lab_assistant(client, hospital_setup):
+    csrf_token = login_helper(client, "lab.assistant", "LabPass!123")
+
+    response = client.patch(
+        f"/api/v1/patients/{hospital_setup['patient_one'].patient_id}",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"address": "Unauthorized"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_admin_can_update_patient_phone(client, hospital_setup):
+    csrf_token = login_helper(client, "admin.one", "AdminPass!1")
+
+    response = client.patch(
+        f"/api/v1/patients/{hospital_setup['patient_one'].patient_id}",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"phone": "03005559999"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["phone"] == "+923005559999"

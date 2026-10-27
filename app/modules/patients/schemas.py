@@ -162,7 +162,10 @@ class PatientVisitResponse(BaseModel):
 class PatientUpdateRequest(BaseModel):
     """Fields that can be changed through the patient update endpoint."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        extra="forbid",
+    )
 
     patient_name: str | None = Field(
         default=None, min_length=1, max_length=150
@@ -170,11 +173,11 @@ class PatientUpdateRequest(BaseModel):
     father_or_husband_name: str | None = Field(
         default=None, max_length=150
     )
-    location: str | None = Field(default=None, max_length=255)
-    phone: str | None = Field(default=None, max_length=20)
+    location: str | None = Field(default=None, max_length=150)
+    phone: str | None = Field(default=None, max_length=30)
     date_of_birth: date | None = None
     gender: str | None = Field(default=None, max_length=30)
-    address: str | None = Field(default=None, max_length=500)
+    address: str | None = Field(default=None, max_length=2000)
 
     @field_validator(
         "patient_name",
@@ -187,7 +190,8 @@ class PatientUpdateRequest(BaseModel):
     @classmethod
     def strip_text(cls, value):
         if isinstance(value, str):
-            value = value.strip()
+            value = " ".join(value.split())
+            return value or None
         return value
 
     @field_validator("phone")

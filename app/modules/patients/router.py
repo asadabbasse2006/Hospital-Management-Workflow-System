@@ -163,7 +163,7 @@ def create_existing_patient_visit(
     ],
 )
 def update_patient_record(
-    patient_business_id: str,
+    patient_business_id: str = Path(min_length=1, max_length=20),
     data: PatientUpdateRequest,
     db: Session = Depends(get_db),
     current_user: UserPublic = Depends(get_current_user),

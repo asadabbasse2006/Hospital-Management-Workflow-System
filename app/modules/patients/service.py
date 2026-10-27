@@ -442,7 +442,10 @@ def update_patient(
     if "phone" in changes and not can_update_phone:
         raise HTTPException(
             status_code=403,
-            detail="Only Receptionists can update a patient's phone number.",
+            detail=(
+                "Only Receptionists and Admins can update a patient's "
+                "phone number."
+            ),
         )
 
     patient = db.scalar(
