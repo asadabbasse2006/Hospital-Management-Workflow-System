@@ -2,7 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select, update, case
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -14,7 +14,9 @@ from app.db.models import (
     Role,
     User,
     Visit,
+    VisitStatusHistory
 )
+
 from app.modules.patients.schemas import (
     CreateVisitRequest,
     PatientCreate,
@@ -22,8 +24,13 @@ from app.modules.patients.schemas import (
     PatientVisitResponse,
     RegisterPatientWithVisit,
     VisitRead,
+    PatientUpdateRequest,
+    VisitQueueRead,
+    VisitStatusTransitionRequest
 )
+
 from app.modules.patients.schemas import normalize_cnic, normalize_phone
+from app.modules.patients.workflow import can_transition
 
 
 def _next_sequence(db: Session, sequence_name: str) -> int:
@@ -123,52 +130,55 @@ def _new_visit(
     return visit
 
 
+
 def register_patient_with_first_visit(
     db: Session,
     data: RegisterPatientWithVisit,
 ) -> PatientVisitResponse:
-    """Create a patient and first visit atomically."""
+    """Create a patient and first visit in one transaction."""
     try:
-        with db.begin():
-            _require_active_doctor(db, data.doctor_id)
-            _ensure_patient_does_not_exist(
-                db, data.cnic, data.phone
-            )
+        _require_active_doctor(db, data.doctor_id)
+        _ensure_patient_does_not_exist(
+            db,
+            data.cnic,
+            data.phone,
+        )
 
-            patient = Patient(
-                patient_id=_next_patient_id(db),
-                patient_name=data.patient_name,
-                cnic=data.cnic,
-                father_or_husband_name=data.father_or_husband_name,
-                location=data.location,
-                phone=data.phone,
-                date_of_birth=data.date_of_birth,
-                gender=data.gender,
-                address=data.address,
-            )
-            db.add(patient)
-            db.flush()
+        patient = Patient(
+            patient_id=_next_patient_id(db),
+            patient_name=data.patient_name,
+            cnic=data.cnic,
+            father_or_husband_name=data.father_or_husband_name,
+            location=data.location,
+            phone=data.phone,
+            date_of_birth=data.date_of_birth,
+            gender=data.gender,
+            address=data.address,
+        )
+        db.add(patient)
+        db.flush()
 
-            visit = Visit(
-                visit_id=_next_visit_id(db),
-                patient_id=patient.id,
-                doctor_id=data.doctor_id,
-                parent_visit_id=None,
-                status="Receptionist",
-                priority=data.priority,
-            )
-            db.add(visit)
-            db.flush()
+        visit = Visit(
+            visit_id=_next_visit_id(db),
+            patient_id=patient.id,
+            doctor_id=data.doctor_id,
+            parent_visit_id=None,
+            status="Receptionist",
+            priority=data.priority,
+        )
+        db.add(visit)
+        db.flush()
 
-            result = PatientVisitResponse(
-                patient=PatientRead.model_validate(patient),
-                visit=VisitRead.model_validate(visit),
-            )
+        result = PatientVisitResponse(
+            patient=PatientRead.model_validate(patient),
+            visit=VisitRead.model_validate(visit),
+        )
 
-        # The transaction commits successfully before returning.
+        db.commit()
         return result
 
     except IntegrityError as exc:
+        db.rollback()
         raise HTTPException(
             status_code=409,
             detail=(
@@ -176,6 +186,11 @@ def register_patient_with_first_visit(
                 "Search for the patient and retry with valid details."
             ),
         ) from exc
+
+    except Exception:
+        db.rollback()
+        raise
+
 
 
 def create_visit_for_existing_patient(
@@ -185,45 +200,52 @@ def create_visit_for_existing_patient(
 ) -> PatientVisitResponse:
     """Create another visit without creating a duplicate patient."""
     try:
-        with db.begin():
-            patient = db.scalar(
-                select(Patient).where(
-                    Patient.patient_id == patient_business_id.upper()
-                )
+        patient = db.scalar(
+            select(Patient).where(
+                Patient.patient_id == patient_business_id.strip().upper()
+            )
+        )
+
+        if patient is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found.",
             )
 
-            if patient is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Patient not found.",
-                )
+        visit = _new_visit(
+            db=db,
+            patient=patient,
+            doctor_id=data.doctor_id,
+            priority=data.priority,
+        )
 
-            visit = _new_visit(
-                db=db,
-                patient=patient,
-                doctor_id=data.doctor_id,
-                priority=data.priority,
-            )
+        result = PatientVisitResponse(
+            patient=PatientRead.model_validate(patient),
+            visit=VisitRead.model_validate(visit),
+        )
 
-            result = PatientVisitResponse(
-                patient=PatientRead.model_validate(patient),
-                visit=VisitRead.model_validate(visit),
-            )
-
+        db.commit()
         return result
 
     except IntegrityError as exc:
+        db.rollback()
         raise HTTPException(
             status_code=409,
             detail="A database constraint conflicted. Please retry.",
         ) from exc
 
+    except Exception:
+        db.rollback()
+        raise
+
 
 def search_patients(
     db: Session,
     query: str,
+    *,
+    doctor_user_id: int | None = None,
 ) -> list[PatientRead]:
-    """Exact search using patient ID, CNIC, or phone."""
+    """Search patients, optionally restricting results to a doctor's patients."""
     query = query.strip()
 
     if not query:
@@ -251,12 +273,229 @@ def search_patients(
         except ValueError:
             pass
 
-    statement = (
-        select(Patient)
-        .where(or_(*conditions))
-        .order_by(Patient.created_at.desc())
-        .limit(20)
-    )
+    statement = select(Patient).where(or_(*conditions))
+
+    if doctor_user_id is not None:
+        statement = statement.where(
+            select(Visit.id)
+            .where(
+                Visit.patient_id == Patient.id,
+                Visit.doctor_id == doctor_user_id,
+            )
+            .exists()
+        )
+
+    statement = statement.order_by(Patient.created_at.desc()).limit(20)
 
     patients = db.scalars(statement).all()
     return [PatientRead.model_validate(patient) for patient in patients]
+
+
+def update_patient(
+    db: Session,
+    patient_business_id: str,
+    data: PatientUpdateRequest,
+    *,
+    can_update_phone: bool,
+    doctor_user_id: int | None = None,
+) -> PatientRead:
+    """Update permitted patient fields and enforce field-level access."""
+    changes = data.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least one field to update.",
+        )
+
+    if "phone" in changes and not can_update_phone:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Receptionists can update a patient's phone number.",
+        )
+
+    patient = db.scalar(
+        select(Patient).where(
+            Patient.patient_id == patient_business_id.strip().upper()
+        )
+    )
+
+    if patient is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found.",
+        )
+
+    if doctor_user_id is not None:
+        has_assigned_visit = db.scalar(
+            select(Visit.id)
+            .where(
+                Visit.patient_id == patient.id,
+                Visit.doctor_id == doctor_user_id,
+            )
+            .limit(1)
+        )
+        if has_assigned_visit is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found.",
+            )
+
+    try:
+        for field, value in changes.items():
+            setattr(patient, field, value)
+
+        # Preserve the database rule that a patient must have
+        # at least a CNIC or phone number.
+        if not patient.cnic and not patient.phone:
+            raise HTTPException(
+                status_code=422,
+                detail="A patient must have a CNIC or phone number.",
+            )
+
+        db.flush()
+        result = PatientRead.model_validate(patient)
+        db.commit()
+        return result
+
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The updated details conflict with an existing record. "
+                "Check the phone number and retry."
+            ),
+        ) from exc
+
+    except Exception:
+        db.rollback()
+        raise
+
+
+def transition_visit(
+    db: Session,
+    visit_business_id: str,
+    target_status: str,
+    role_name: str,
+    actor_user_id: int,
+    reason: str | None = None,
+) -> Visit:
+    """Apply a permitted visit status transition."""
+    try:
+        visit = db.scalar(
+            select(Visit)
+            .where(Visit.visit_id == visit_business_id.strip().upper())
+            .with_for_update()
+        )
+
+        if visit is None or (role_name == "Doctor" and visit.doctor_id != actor_user_id):
+            raise HTTPException(
+                status_code=404,
+                detail="Visit not found.",
+            )
+
+        if not can_transition(
+            visit.status,
+            role_name,
+            target_status,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Role '{role_name}' cannot change a visit "
+                    f"from '{visit.status}' to '{target_status}'."
+                ),
+            )
+        old_status = visit.status
+
+        visit.status = target_status
+
+        if target_status == "Completed":
+            visit.closed_at = datetime.now(ZoneInfo("Asia/Karachi"))
+
+        db.add(
+            VisitStatusHistory(
+                visit_pk=visit.id,
+                changed_by_user_id=actor_user_id,
+                from_status=old_status,
+                to_status=target_status,
+                reason=reason,
+            )
+        )
+
+        db.flush()
+        db.commit()
+        db.refresh(visit)
+        return visit
+
+    except Exception:
+        db.rollback()
+        raise
+
+
+def get_visit_queue(
+    db: Session,
+    role_name: str,
+    user_id: int,
+) -> list[dict]:
+    """Return the open queue relevant to the caller's department."""
+    role_statuses = {
+        "Receptionist": ["Receptionist", "Visits"],
+        "Doctor": ["With Doctor"],
+        "Lab Assistant": ["Lab Tests"],
+        "Pathologist": ["Lab Tests"],
+        "Pharmacy Assistant": ["Pharmacy"],
+        "Printing Assistant": ["Printing"],
+    }
+
+    if role_name == "Admin":
+        statuses = [
+            "Receptionist",
+            "Visits",
+            "With Doctor",
+            "Lab Tests",
+            "Pharmacy",
+            "Printing",
+        ]
+    else:
+        statuses = role_statuses.get(role_name, [])
+
+    if not statuses:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to a visit queue.",
+        )
+
+    statement = (
+        select(Visit, Patient)
+        .join(Patient, Patient.id == Visit.patient_id)
+        .where(Visit.status.in_(statuses))
+        .order_by(
+            case(
+                (Visit.priority == "Emergency", 0),
+                else_=1,
+            ),
+            Visit.created_at.asc(),
+        )
+    )
+
+    # Doctors should see only their own assigned visits.
+    if role_name == "Doctor":
+        statement = statement.where(Visit.doctor_id == user_id)
+
+    rows = db.execute(statement).all()
+
+    return [
+        {
+            "id": visit.id,
+            "visit_id": visit.visit_id,
+            "patient_business_id": patient.patient_id,
+            "patient_name": patient.patient_name,
+            "doctor_id": visit.doctor_id,
+            "status": visit.status,
+            "priority": visit.priority,
+            "created_at": visit.created_at,
+        }
+        for visit, patient in rows
+    ]

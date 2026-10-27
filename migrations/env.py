@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, pool
 from app.core.config import settings
 from app.db.base import Base
 import app.db.models  # Register all SQLAlchemy models
+import app.db.laboratory_models
 
 
 config = context.config
