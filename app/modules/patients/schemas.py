@@ -59,7 +59,28 @@ class PatientCreate(BaseModel):
     phone: str | None = Field(default=None, max_length=30)
     date_of_birth: date | None = None
     gender: str | None = Field(default=None, max_length=30)
-    address: str | None = None
+    address: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("patient_name")
+    @classmethod
+    def normalize_patient_name(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Patient name is required.")
+        return value
+
+    @field_validator(
+        "father_or_husband_name",
+        "location",
+        "gender",
+        "address",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
 
     @field_validator("cnic", mode="before")
     @classmethod

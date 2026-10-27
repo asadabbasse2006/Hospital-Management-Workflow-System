@@ -21,6 +21,7 @@ from app.modules.patients.schemas import (
     CreateVisitRequest,
     PatientCreate,
     PatientRead,
+    PatientSearchRead,
     PatientVisitResponse,
     RegisterPatientWithVisit,
     VisitRead,
@@ -31,6 +32,46 @@ from app.modules.patients.schemas import (
 
 from app.modules.patients.schemas import normalize_cnic, normalize_phone
 from app.modules.patients.workflow import can_transition
+
+PATIENT_ID_RETRY_LIMIT = 5
+PATIENT_ID_UNIQUE_CONSTRAINT = "uq_patients_patient_id"
+PATIENT_CONTACT_UNIQUE_CONSTRAINTS = {
+    "uq_patients_cnic",
+    "uq_patients_phone",
+}
+
+
+def _constraint_name(exc: IntegrityError) -> str | None:
+    orig = getattr(exc, "orig", None)
+    diag = getattr(orig, "diag", None)
+    return getattr(diag, "constraint_name", None)
+
+
+def _conflict_http_exception(exc: IntegrityError) -> HTTPException:
+    constraint = _constraint_name(exc)
+    if constraint in PATIENT_CONTACT_UNIQUE_CONSTRAINTS:
+        return HTTPException(
+            status_code=409,
+            detail=(
+                "A patient with this CNIC or phone number already exists. "
+                "Search for the existing patient before registering another."
+            ),
+        )
+    return HTTPException(
+        status_code=409,
+        detail=(
+            "A unique identifier or database constraint conflicted. "
+            "Search for the patient and retry with valid details."
+        ),
+    )
+
+
+def _escape_like_term(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
 
 
 def _next_sequence(db: Session, sequence_name: str) -> int:
@@ -130,6 +171,68 @@ def _new_visit(
     return visit
 
 
+def _create_patient_record(db: Session, data: PatientCreate) -> Patient:
+    """Insert a patient with a generated identifier. Does not commit."""
+    _ensure_patient_does_not_exist(db, data.cnic, data.phone)
+
+    last_conflict: IntegrityError | None = None
+
+    for _ in range(PATIENT_ID_RETRY_LIMIT):
+        patient_id = _next_patient_id(db)
+
+        try:
+            with db.begin_nested():
+                patient = Patient(
+                    patient_id=patient_id,
+                    patient_name=data.patient_name,
+                    cnic=data.cnic,
+                    father_or_husband_name=data.father_or_husband_name,
+                    location=data.location,
+                    phone=data.phone,
+                    date_of_birth=data.date_of_birth,
+                    gender=data.gender,
+                    address=data.address,
+                )
+                db.add(patient)
+                db.flush()
+                return patient
+        except IntegrityError as exc:
+            last_conflict = exc
+            if _constraint_name(exc) == PATIENT_ID_UNIQUE_CONSTRAINT:
+                continue
+            raise _conflict_http_exception(exc) from exc
+
+    if last_conflict is not None:
+        raise _conflict_http_exception(last_conflict) from last_conflict
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "A unique identifier or database constraint conflicted. "
+            "Search for the patient and retry with valid details."
+        ),
+    )
+
+
+def register_patient(
+    db: Session,
+    data: PatientCreate,
+) -> PatientRead:
+    """Register a patient and persist a unique business identifier."""
+    try:
+        patient = _create_patient_record(db, data)
+        result = PatientRead.model_validate(patient)
+        db.commit()
+        return result
+
+    except IntegrityError as exc:
+        db.rollback()
+        raise _conflict_http_exception(exc) from exc
+
+    except Exception:
+        db.rollback()
+        raise
+
 
 def register_patient_with_first_visit(
     db: Session,
@@ -138,25 +241,7 @@ def register_patient_with_first_visit(
     """Create a patient and first visit in one transaction."""
     try:
         _require_active_doctor(db, data.doctor_id)
-        _ensure_patient_does_not_exist(
-            db,
-            data.cnic,
-            data.phone,
-        )
-
-        patient = Patient(
-            patient_id=_next_patient_id(db),
-            patient_name=data.patient_name,
-            cnic=data.cnic,
-            father_or_husband_name=data.father_or_husband_name,
-            location=data.location,
-            phone=data.phone,
-            date_of_birth=data.date_of_birth,
-            gender=data.gender,
-            address=data.address,
-        )
-        db.add(patient)
-        db.flush()
+        patient = _create_patient_record(db, data)
 
         visit = Visit(
             visit_id=_next_visit_id(db),
@@ -179,13 +264,7 @@ def register_patient_with_first_visit(
 
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "A unique identifier or database constraint conflicted. "
-                "Search for the patient and retry with valid details."
-            ),
-        ) from exc
+        raise _conflict_http_exception(exc) from exc
 
     except Exception:
         db.rollback()
@@ -239,22 +318,70 @@ def create_visit_for_existing_patient(
         raise
 
 
+def _patient_visible_to_doctor(doctor_user_id: int):
+    return (
+        select(Visit.id)
+        .where(
+            Visit.patient_id == Patient.id,
+            Visit.doctor_id == doctor_user_id,
+        )
+        .exists()
+    )
+
+
+def get_patient(
+    db: Session,
+    patient_business_id: str,
+    *,
+    doctor_user_id: int | None = None,
+) -> PatientRead:
+    """Return one patient by generated identifier, or 404."""
+    identifier = patient_business_id.strip().upper()
+
+    if not identifier:
+        raise HTTPException(
+            status_code=422,
+            detail="Enter a valid Patient ID.",
+        )
+
+    statement = select(Patient).where(Patient.patient_id == identifier)
+
+    if doctor_user_id is not None:
+        statement = statement.where(_patient_visible_to_doctor(doctor_user_id))
+
+    patient = db.scalar(statement)
+
+    if patient is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found.",
+        )
+
+    return PatientRead.model_validate(patient)
+
+
 def search_patients(
     db: Session,
     query: str,
     *,
+    offset: int = 0,
+    limit: int = 50,
     doctor_user_id: int | None = None,
-) -> list[PatientRead]:
-    """Search patients, optionally restricting results to a doctor's patients."""
+) -> list[PatientSearchRead]:
+    """Search patients at the database, with stable ordering and pagination."""
     query = query.strip()
 
     if not query:
         raise HTTPException(
             status_code=422,
-            detail="Enter a Patient ID, CNIC, or phone number.",
+            detail="Enter a Patient ID, name, CNIC, or phone number.",
         )
 
-    conditions = [Patient.patient_id == query.upper()]
+    like_term = f"%{_escape_like_term(query)}%"
+    conditions = [
+        Patient.patient_id == query.upper(),
+        Patient.patient_name.ilike(like_term, escape="\\"),
+    ]
     digits = "".join(character for character in query if character.isdigit())
 
     if len(digits) == 13:
@@ -265,7 +392,7 @@ def search_patients(
         except ValueError:
             pass
 
-    if len(digits) >= 7:
+    if 7 <= len(digits) <= 15:
         try:
             phone = normalize_phone(query)
             if phone:
@@ -273,22 +400,26 @@ def search_patients(
         except ValueError:
             pass
 
-    statement = select(Patient).where(or_(*conditions))
+    statement = select(
+        Patient.patient_id,
+        Patient.patient_name,
+        Patient.gender,
+    ).where(or_(*conditions))
 
     if doctor_user_id is not None:
-        statement = statement.where(
-            select(Visit.id)
-            .where(
-                Visit.patient_id == Patient.id,
-                Visit.doctor_id == doctor_user_id,
-            )
-            .exists()
-        )
+        statement = statement.where(_patient_visible_to_doctor(doctor_user_id))
 
-    statement = statement.order_by(Patient.created_at.desc()).limit(20)
+    statement = (
+        statement.order_by(Patient.created_at.desc(), Patient.id.asc())
+        .offset(offset)
+        .limit(limit)
+    )
 
-    patients = db.scalars(statement).all()
-    return [PatientRead.model_validate(patient) for patient in patients]
+    patients = db.execute(statement).all()
+    return [
+        PatientSearchRead.model_validate(patient._mapping)
+        for patient in patients
+    ]
 
 
 def update_patient(
