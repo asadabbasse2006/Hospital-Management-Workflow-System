@@ -1,6 +1,7 @@
 from app.modules.patients.router import router as patients_router
 from app.modules.laboratory.router import router as laboratory_router
 from app.modules.users.router import router as users_router
+from app.modules.departments.router import router as departments_router
 
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
@@ -22,6 +23,7 @@ app = FastAPI(
 app.include_router(patients_router, prefix="/api/v1")
 app.include_router(laboratory_router, prefix="/api/v1")
 app.include_router(users_router, prefix="/api/v1")
+app.include_router(departments_router, prefix="/api/v1")
 
 app.state.limiter = limiter
 app.add_exception_handler(
